@@ -2,6 +2,7 @@ import io
 import os
 import re
 import unicodedata
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -246,18 +247,61 @@ def to_excel_bytes(df):
 # =====================================================================
 # PAGES
 # =====================================================================
-# Path dataset gabungan asli
-GABUNGAN_DATASET_PATH = r"f:\belajar 2.0\Season 7\DGX\FGD\output\output\csv\gabungan.csv"
+# Lokasi dataset gabungan.csv (dicari relatif terhadap file app ini, BUKAN path Windows lokal)
+APP_DIR = Path(__file__).resolve().parent
+GABUNGAN_CANDIDATES = [
+    APP_DIR / "gabungan.csv",
+    APP_DIR / "data" / "gabungan.csv",
+    APP_DIR / ".streamlit" / "gabungan.csv",
+    Path.cwd() / "gabungan.csv",
+    Path.cwd() / "data" / "gabungan.csv",
+]
+GABUNGAN_REQUIRED = ["Tempat", "Nama", "Rating", "Waktu_Kunjungan", "Ulasan_Bersih"]
+
+
+def list_csv_files():
+    out = []
+    for root, dirs, files in os.walk(APP_DIR):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for f in files:
+            if f.lower().endswith(".csv"):
+                out.append(Path(root) / f)
+    return out
+
+
+def find_gabungan():
+    for p in GABUNGAN_CANDIDATES:
+        if p.is_file():
+            return p
+    # cadangan: cari di seluruh folder repo (nama file tidak peka huruf besar/kecil)
+    for p in list_csv_files():
+        if p.name.lower() == "gabungan.csv":
+            return p
+    return None
 
 
 @st.cache_data
 def load_dataset_overview():
-    if os.path.exists(GABUNGAN_DATASET_PATH):
+    """Return (DataFrame | None, pesan_error | None)."""
+    path = find_gabungan()
+    if path is None:
+        found = sorted(str(p.relative_to(APP_DIR)) for p in list_csv_files())[:10]
+        return None, "File tidak ditemukan. File .csv yang terlihat di server: " + (", ".join(found) or "(tidak ada)")
+    df = None
+    for enc in ("utf-8-sig", "latin-1"):
         try:
-            return pd.read_csv(GABUNGAN_DATASET_PATH)
-        except Exception:
-            return None
-    return None
+            df = pd.read_csv(path, encoding=enc)
+            break
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            return None, f"Gagal membaca {path.name}: {e}"
+    if df is None:
+        return None, f"Gagal membaca {path.name}."
+    missing = [c for c in GABUNGAN_REQUIRED if c not in df.columns]
+    if missing:
+        return None, f"Kolom tidak ditemukan: {missing}. Kolom yang ada: {list(df.columns)}"
+    return df, None
 
 
 def page_dashboard():
@@ -294,7 +338,7 @@ def page_dashboard():
        
 
     with tab_dataset:
-        df_raw = load_dataset_overview()
+        df_raw, load_err = load_dataset_overview()
 
         if df_raw is not None:
             total_rows = len(df_raw)
@@ -339,7 +383,9 @@ def page_dashboard():
                 use_container_width=True
             )
         else:
-            st.warning("File dataset `gabungan.csv` belum ditemukan di lokasi yang ditentukan.")
+            st.warning("Dataset `gabungan.csv` belum bisa dimuat.")
+            if load_err:
+                st.caption(load_err)
 
     with tab_model_info:
         st.subheader("🤖 Pendekatan Model & Deployment")
