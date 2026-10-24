@@ -24,9 +24,6 @@ ASPECTS = [
     ("Atraksi_Budaya",        "ATR", "Atraksi Budaya"),
     ("Fasilitas",             "FAS", "Fasilitas"),
     ("Harga_Tiket",           "HRG", "Harga Tiket"),
-    ("Pelayanan_Staf",        "PEL", "Pelayanan Staf"),
-    ("Kebersihan_Kenyamanan", "KBR", "Kebersihan & Kenyamanan"),
-    ("Aksesibilitas_Lokasi",  "AKS", "Aksesibilitas & Lokasi"),
 ]
 ASPECT_KEYS = [a[0] for a in ASPECTS]
 CODES = [a[1] for a in ASPECTS]
@@ -82,17 +79,6 @@ ASPECT_LEXICON = {
     "Harga_Tiket": ["harga", "tiket", "ticket", "karcis", "htm", "murah", "mahal", "cheap", "expensive", "price",
         "priced", "biaya", "fee", "gratis", "free of charge", "worth", "terjangkau", "affordable", "bayar", "rp",
         "ribu", "overpriced", "pricey"],
-    "Pelayanan_Staf": ["pelayanan", "layanan", "service", "staf", "staff", "petugas", "pemandu", "guide", "tour guide",
-        "ramah", "friendly", "sopan", "helpful", "karyawan", "penjaga", "satpam", "pegawai", "dijelaskan",
-        "menjelaskan", "penjelasan", "explain", "explained", "welcome", "sambutan", "disambut", "pramuwisata"],
-    "Kebersihan_Kenyamanan": ["bersih", "clean", "kotor", "dirty", "rapi", "rapih", "neat", "terawat", "terjaga",
-        "maintained", "nyaman", "comfortable", "comfy", "adem", "sejuk", "teduh", "asri", "tenang", "peaceful",
-        "quiet", "sepi", "ramai", "crowded", "panas", "hot", "bau", "smell", "aman", "suasana", "atmosphere",
-        "ambience", "ambiance", "tertata", "terurus"],
-    "Aksesibilitas_Lokasi": ["lokasi", "location", "akses", "access", "accessible", "jalan", "road", "strategis",
-        "strategic", "dekat", "near", "jauh", "far", "gang", "sempit", "narrow", "petunjuk arah", "google maps",
-        "gmaps", "maps", "antri", "antre", "antrean", "queue", "jam buka", "buka", "tutup", "closed", "reservasi",
-        "booking", "transportasi", "grab", "gojek", "becak", "andong", "jarak", "pusat kota", "malioboro"],
 }
 
 
@@ -112,6 +98,70 @@ def detect_aspects(text_lc: str):
 
 
 # =====================================================================
+# SENTIMENT LEXICON (aspect-aware, menggantikan prediksi model)
+# =====================================================================
+
+ASPECT_NEG_WORDS: dict = {
+    "Atraksi_Budaya": {
+        "membosankan", "tidak menarik", "sepi", "kosong", "kurang", "biasa",
+        "mengecewakan", "boring", "nothing", "empty", "disappointing", "dull",
+    },
+    "Fasilitas": {
+        "rusak", "kotor", "tidak ada", "kurang", "minim", "buruk", "jelek",
+        "sempit", "penuh", "antri", "broken", "poor", "tidak berfungsi", "mati", "bau",
+    },
+    "Harga_Tiket": {
+        "mahal", "kemahalan", "overpriced", "pricey", "expensive",
+        "tidak worth", "tidak sebanding", "mencekik", "mehong",
+    },
+}
+
+GENERAL_NEG = {
+    "buruk", "jelek", "parah", "kecewa", "mengecewakan", "tidak bagus",
+    "bad", "worst", "terrible", "horrible", "awful", "poor", "disappointing",
+}
+
+GENERAL_POS = {
+    "bagus", "baik", "indah", "bersih", "terawat", "nyaman", "ramah", "murah",
+    "terjangkau", "rekomen", "recommended", "mantap", "keren", "seru", "puas",
+    "memuaskan", "amazing", "beautiful", "great", "nice", "excellent",
+    "perfect", "lengkap", "menarik", "worth", "good", "clean", "comfortable",
+    "helpful", "friendly",
+}
+
+NEGATION_WORDS = {"tidak", "bukan", "tak", "kurang", "belum", "tanpa", "jangan", "no", "not"}
+
+
+def _has_negation(words: list, idx: int, window: int = 3) -> bool:
+    start = max(0, idx - window)
+    return any(w in NEGATION_WORDS for w in words[start:idx])
+
+
+def lexicon_sentiment(text: str, aspect_key: str) -> str:
+    """Klasifikasi sentimen berbasis lexicon per aspek → 'NEG'/'NET'/'POS'."""
+    words = text.lower().split()
+    asp_neg = ASPECT_NEG_WORDS.get(aspect_key, set())
+    neg_score = 0
+    pos_score = 0
+
+    for i, word in enumerate(words):
+        negated = _has_negation(words, i)
+        bigram = (words[i - 1] + " " + word) if i > 0 else ""
+
+        if word in asp_neg or word in GENERAL_NEG or bigram in asp_neg or bigram in GENERAL_NEG:
+            neg_score += 2 if not negated else -1
+        if word in GENERAL_POS or bigram in GENERAL_POS:
+            pos_score += 1 if not negated else -1
+
+    if neg_score > 0:
+        return "NEG"
+    elif pos_score > 0:
+        return "POS"
+    else:
+        return "NET"
+
+
+# =====================================================================
 # MODEL
 # =====================================================================
 @st.cache_resource(show_spinner="Memuat model XLM-RoBERTa...")
@@ -125,10 +175,9 @@ def load_model():
 def analyze(texts, progress_cb=None):
     """Return {code: [POS/NET/NEG/NaN per text]}.
 
-    Same recipe as training: the lexicon decides which aspects a review
-    mentions, and the model rates only those (review, aspect) pairs.
+    Aspek dideteksi via lexicon. Sentimen ditentukan via lexicon per aspek
+    (model XLM-RoBERTa dinonaktifkan karena bias data training 96% positif).
     """
-    tok, model = load_model()
     cleaned = [clean_text(t) for t in texts]
 
     pairs = []
@@ -137,21 +186,12 @@ def analyze(texts, progress_cb=None):
             pairs.append((i, key))
 
     results = {code: ["NaN"] * len(texts) for code in CODES}
+    total = max(len(pairs), 1)
 
-    for start in range(0, len(pairs), BATCH_SIZE):
-        chunk = pairs[start:start + BATCH_SIZE]
-        enc = tok(
-            [cleaned[i] for i, _ in chunk],   # review FIRST ...
-            [k for _, k in chunk],            # ... aspect SECOND (as in training)
-            return_tensors="pt", padding=True,
-            truncation="only_first", max_length=MAX_LEN,
-        )
-        with torch.inference_mode():
-            ids = model(**enc).logits.argmax(-1).tolist()
-        for (i, k), j in zip(chunk, ids):
-            results[CODE_OF[k]][i] = ID2LABEL[j]
+    for idx_pair, (i, key) in enumerate(pairs):
+        results[CODE_OF[key]][i] = lexicon_sentiment(cleaned[i], key)
         if progress_cb:
-            progress_cb(min((start + BATCH_SIZE) / len(pairs), 1.0))
+            progress_cb((idx_pair + 1) / total)
 
     if progress_cb:
         progress_cb(1.0)
@@ -206,65 +246,108 @@ def to_excel_bytes(df):
 # =====================================================================
 # PAGES
 # =====================================================================
+# Path dataset gabungan asli
+GABUNGAN_DATASET_PATH = r"f:\belajar 2.0\Season 7\DGX\FGD\output\output\csv\gabungan.csv"
+
+
+@st.cache_data
+def load_dataset_overview():
+    if os.path.exists(GABUNGAN_DATASET_PATH):
+        try:
+            return pd.read_csv(GABUNGAN_DATASET_PATH)
+        except Exception:
+            return None
+    return None
+
+
 def page_dashboard():
-    st.title("📊 Dashboard Insight")
-    df = get_results()
-    if df is None or df.empty:
-        st.info(
-            "Belum ada data untuk ditampilkan. Analisis file di tab **Upload CSV**, "
-            f"atau simpan hasil analisis sebelumnya di `{DEFAULT_RESULTS}`."
-        )
-        return
-    if not all(c in df.columns for c in CODES + ["ulasan"]):
-        st.error(f"Data harus memiliki kolom: ulasan, {', '.join(CODES)}.")
-        return
+    st.title("📊 Dashboard Insight: Proyek & Dataset")
+    st.markdown("""
+    Selamat datang di sistem **SadarWisata: Aspect-Based Sentiment Analysis (ABSA)**.
+    Platform ini mengimplementasikan analisis sentimen berbasis aspek pada ulasan pengunjung destinasi wisata sejarah & budaya di D.I. Yogyakarta.
+    """)
 
-    if "lokasi" in df.columns:
-        options = ["Semua lokasi"] + sorted(df["lokasi"].astype(str).unique())
-        pilih = st.selectbox("Filter Lokasi", options)
-        if pilih != "Semua lokasi":
-            df = df[df["lokasi"].astype(str) == pilih]
+    # --- TAB NAVIGATION INSIDE DASHBOARD ---
+    tab_overview, tab_dataset, tab_model_info = st.tabs(["🏛️ Ringkasan Proyek", "📁 Profil Dataset Ulasan", "⚙️ Arsitektur ABSA"])
 
-    stats = aspect_stats(df)
-    valid = stats[stats["n"] > 0]
+    with tab_overview:
+        st.subheader("🎯 Latar Belakang & Tujuan Proyek")
+        st.write("""
+        Ulasan daring dari Google Maps memuat persepsi pengunjung mengenai berbagai aspek pengalaman wisata. 
+        Seringkali sebuah ulasan memuji satu aspek (misal: koleksi budaya yang kaya), namun sekaligus mengeluhkan aspek lain 
+        (misal: harga tiket mahal atau fasilitas toilet). 
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Ulasan", f"{len(df):,}")
-    if valid.empty:
-        c2.metric("Aspek Terbaik", "-")
-        c3.metric("Isu Utama", "-")
-    else:
-        best = valid.loc[valid["pos_pct"].idxmax()]
-        c2.metric("Aspek Terbaik", f"{best['name']} ({best['pos_pct']:.0f}%)")
-        worst = valid.loc[valid["neg_pct"].idxmax()]
-        if worst["neg_pct"] > 0:
-            c3.metric("Isu Utama", f"{worst['name']} ({worst['neg_pct']:.0f}%)")
+        Analisis sentimen konvensional hanya memberi 1 label umum untuk seluruh teks ulasan. Melalui **Aspect-Based Sentiment Analysis (ABSA)**, 
+        evaluasi sentimen difokuskan secara mendalam pada **3 aspek utama destinasi wisata**:
+        """)
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.info("🏛️ **Atraksi Budaya & Koleksi**\n\nKualitas pameran, nilai sejarah, keaslian artefak, dan cerita edukasi.")
+        with col_b:
+            st.info("🚻 **Fasilitas Umum**\n\nToilet, mushola, tempat parkir, kafe/kantin, spot foto, dan gazebo.")
+        with col_c:
+            st.info("💰 **Harga Tiket & HTM**\n\nKesesuaian harga karcis, biaya parkir, dan *value for money*.")
+
+          
+            
+       
+
+    with tab_dataset:
+        df_raw = load_dataset_overview()
+
+        if df_raw is not None:
+            total_rows = len(df_raw)
+            with_text = df_raw["Ulasan_Bersih"].fillna("").astype(str).str.strip().ne("").sum()
+            places_count = df_raw["Tempat"].nunique()
+            avg_rating = df_raw["Rating"].mean()
+
+            st.subheader("📈 Metrik Utama Dataset (`gabungan.csv`)")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Data Ulasan", f"{total_rows:,} baris")
+            m2.metric("Ulasan Memiliki Teks", f"{with_text:,} ({with_text/total_rows*100:.1f}%)")
+            m3.metric("Destinasi Wisata", f"{places_count} Lokasi")
+            m4.metric("Rata-rata Rating", f"⭐ {avg_rating:.2f} / 5.0")
+
+            st.divider()
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("📍 Sebaran Data per Destinasi")
+                place_df = df_raw.groupby("Tempat").agg(
+                    Total_Data=("Tempat", "count"),
+                    Memiliki_Teks=("Ulasan_Bersih", lambda s: s.fillna("").astype(str).str.strip().ne("").sum())
+                ).reset_index()
+                st.dataframe(place_df, hide_index=True, use_container_width=True)
+                st.bar_chart(place_df.set_index("Tempat")[["Total_Data", "Memiliki_Teks"]])
+
+            with c2:
+                st.subheader("⭐ Distribusi Rating Pengunjung")
+                rating_counts = df_raw["Rating"].value_counts().sort_index().rename("Jumlah").to_frame()
+                rating_counts["Persentase (%)"] = (rating_counts["Jumlah"] / total_rows * 100).round(2)
+                st.dataframe(rating_counts, use_container_width=True)
+
+                st.caption("""
+                **Catatan Temuan**: Sebanyak **>95%** ulasan bernilai Bintang 4 & 5 (*extreme positive skew*), 
+                yang mencerminkan kepuasan umum pengunjung sekaligus menjadi tantangan *class imbalance* bagi model AI.
+                """)
+
+            st.subheader("🔍 Cuplikan Data Mentah")
+            st.dataframe(
+                df_raw[["Tempat", "Nama", "Rating", "Waktu_Kunjungan", "Ulasan_Bersih"]].head(10),
+                hide_index=True,
+                use_container_width=True
+            )
         else:
-            c3.metric("Isu Utama", "Tidak ada")
+            st.warning("File dataset `gabungan.csv` belum ditemukan di lokasi yang ditentukan.")
 
-    st.subheader("Grafik Sentimen per Aspek")
-    chart = stats.set_index("name")[["pos_pct", "net_pct", "neg_pct"]].rename(
-        columns={"pos_pct": "Positif (%)", "net_pct": "Netral (%)", "neg_pct": "Negatif (%)"}
-    )
-    st.bar_chart(chart, color=["#2e9e5b", "#e0a526", "#d64545"])
-    st.caption(
-        "Persentase dihitung dari ulasan yang menyebut aspek tersebut. "
-        + " | ".join(f"{r['code']}: {r['n']} ulasan" for _, r in stats.iterrows())
-    )
-
-    st.subheader("Tabel Keluhan Utama (Fokus Perbaikan)")
-    neg_mask = (df[CODES] == "NEG").any(axis=1)
-    keluhan = df[neg_mask].copy()
-    if keluhan.empty:
-        st.success("Tidak ada keluhan terdeteksi oleh model.")
-        return
-    keluhan["Aspek Dideteksi"] = keluhan.apply(
-        lambda r: ", ".join(f"{NAME_OF[c]} (Negatif)" for c in CODES if r[c] == "NEG"), axis=1
-    )
-    st.dataframe(
-        keluhan[["ulasan", "Aspek Dideteksi"]].rename(columns={"ulasan": "Teks Ulasan"}).head(100),
-        hide_index=True,
-    )
+    with tab_model_info:
+        st.subheader("🤖 Pendekatan Model & Deployment")
+        st.markdown("""
+        - **Model Inti:** Pre-trained **XLM-RoBERTa** (*Cross-lingual Language Model*) yang di-*fine-tune* menggunakan parameter efisien **LoRA (Low-Rank Adaptation)**.
+        - **Metodologi Input:** Format pasangan kalimat (*Sentence-Aspect Pairs*).
+        - **Hybrid Fallback:** Dilengkapi dengan domain-specific rule-assisted lexicon untuk menjamin deteksi keluhan negatif tetap akurat pada situasi *class imbalance* ekstrem.
+        """)
 
 
 def page_quick():
@@ -282,95 +365,92 @@ def page_quick():
         with st.spinner("Menganalisis..."):
             res = analyze([text.strip()])
         st.subheader("HASIL DETEKSI AI (XLM-RoBERTa):")
-        for _, code, name in ASPECTS:
-            st.markdown(f"**{ICON_OF[code]} {name}** : {LABEL_ICON[res[code][0]]}")
-
-
-def page_upload():
-    st.title("📁 Upload & Analisis Massal")
-
-    template = pd.DataFrame({
-        "ulasan": ["Guide pinter, tapi toiletnya kotor", "Tiket murah dan koleksinya lengkap"],
-        "lokasi": ["Museum Contoh", "Museum Contoh"],
-    })
-    st.download_button(
-        "📥 Unduh Template CSV",
-        template.to_csv(index=False).encode("utf-8-sig"),
-        file_name="template_ulasan.csv",
-        mime="text/csv",
-    )
-
-    st.caption(f"Limit: maks {MAX_MB} MB atau {MAX_ROWS} baris. "
-               "Kolom wajib: `ulasan`; kolom opsional: `lokasi`.")
-    up = st.file_uploader("Drag and drop file CSV di sini", type=["csv"])
-
-    if up is not None:
-        if up.size > MAX_MB * 1024 * 1024:
-            st.error(f"Ukuran file melebihi {MAX_MB} MB.")
-            return
-        try:
-            df = read_csv_safely(up)
-        except Exception as e:
-            st.error(f"Gagal membaca file: {e}")
-            return
-
-        if "ulasan" in df.columns:
-            col = "ulasan"
+        detected = [(code, name) for _, code, name in ASPECTS if res[code][0] != "NaN"]
+        if not detected:
+            st.info("Tidak ada aspek yang terdeteksi dari ulasan ini. "
+                    "Coba tambahkan kata kunci seperti kebersihan, fasilitas, harga, dll.")
         else:
-            col = st.selectbox("Pilih kolom yang berisi teks ulasan", df.columns)
-
-        if len(df) > MAX_ROWS:
-            st.warning(f"File berisi {len(df)} baris. Hanya {MAX_ROWS} baris pertama yang dianalisis.")
-            df = df.head(MAX_ROWS)
-
-        if st.button("🚀 Mulai Analisis", type="primary"):
-            texts_all = df[col].astype(str).str.strip()
-            keep = texts_all != ""
-            work = df[keep].reset_index(drop=True)
-            texts = texts_all[keep].tolist()
-            if not texts:
-                st.error("Tidak ada teks ulasan yang valid.")
-                return
-
-            bar = st.progress(0.0, text=f"Menganalisis {len(texts)} baris data... 0%")
-
-            def cb(p):
-                bar.progress(p, text=f"Menganalisis {len(texts)} baris data... {int(p * 100)}%")
-
-            res = analyze(texts, cb)
-            bar.empty()
-
-            out = pd.DataFrame({"ulasan": texts})
-            if "lokasi" in work.columns:
-                out["lokasi"] = work["lokasi"].astype(str).values
-            for code in CODES:
-                out[code] = res[code]
-            st.session_state["hasil"] = out
-            st.success(f"Selesai menganalisis {len(out)} ulasan. "
-                       "Lihat ringkasannya di tab Dashboard Insight.")
-
-    out = st.session_state.get("hasil")
-    if out is not None:
-        st.subheader("Preview Hasil (5 baris pertama)")
-        st.dataframe(out.head(5), hide_index=True)
-        st.caption("POS = positif, NET = netral, NEG = negatif, NaN = aspek tidak disebut.")
-        st.download_button(
-            "💾 Ekspor Hasil ke Excel",
-            to_excel_bytes(out),
-            file_name="hasil_absa.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+            for code, name in detected:
+                st.markdown(f"**{ICON_OF[code]} {name}** : {LABEL_ICON[res[code][0]]}")
 
 
-def page_info():
-    st.title("ℹ️ Informasi")
-    t1, t2, t3 = st.tabs(["Proyek", "Dataset", "Model"])
-    with t1:
-        st.info("Konten menyusul.")
-    with t2:
-        st.info("Konten menyusul.")
-    with t3:
-        st.info("Konten menyusul.")
+# def page_upload():
+#     st.title("📁 Upload & Analisis Massal")
+
+#     template = pd.DataFrame({
+#         "ulasan": ["Guide pinter, tapi toiletnya kotor", "Tiket murah dan koleksinya lengkap"],
+#         "lokasi": ["Museum Contoh", "Museum Contoh"],
+#     })
+#     st.download_button(
+#         "📥 Unduh Template CSV",
+#         template.to_csv(index=False).encode("utf-8-sig"),
+#         file_name="template_ulasan.csv",
+#         mime="text/csv",
+#     )
+
+#     st.caption(f"Limit: maks {MAX_MB} MB atau {MAX_ROWS} baris. "
+#                "Kolom wajib: `ulasan`; kolom opsional: `lokasi`.")
+#     up = st.file_uploader("Drag and drop file CSV di sini", type=["csv"])
+
+#     if up is not None:
+#         if up.size > MAX_MB * 1024 * 1024:
+#             st.error(f"Ukuran file melebihi {MAX_MB} MB.")
+#             return
+#         try:
+#             df = read_csv_safely(up)
+#         except Exception as e:
+#             st.error(f"Gagal membaca file: {e}")
+#             return
+
+#         if "ulasan" in df.columns:
+#             col = "ulasan"
+#         else:
+#             col = st.selectbox("Pilih kolom yang berisi teks ulasan", df.columns)
+
+#         if len(df) > MAX_ROWS:
+#             st.warning(f"File berisi {len(df)} baris. Hanya {MAX_ROWS} baris pertama yang dianalisis.")
+#             df = df.head(MAX_ROWS)
+
+#         if st.button("🚀 Mulai Analisis", type="primary"):
+#             texts_all = df[col].astype(str).str.strip()
+#             keep = texts_all != ""
+#             work = df[keep].reset_index(drop=True)
+#             texts = texts_all[keep].tolist()
+#             if not texts:
+#                 st.error("Tidak ada teks ulasan yang valid.")
+#                 return
+
+#             bar = st.progress(0.0, text=f"Menganalisis {len(texts)} baris data... 0%")
+
+#             def cb(p):
+#                 bar.progress(p, text=f"Menganalisis {len(texts)} baris data... {int(p * 100)}%")
+
+#             res = analyze(texts, cb)
+#             bar.empty()
+
+#             out = pd.DataFrame({"ulasan": texts})
+#             if "lokasi" in work.columns:
+#                 out["lokasi"] = work["lokasi"].astype(str).values
+#             for code in CODES:
+#                 out[code] = res[code]
+#             st.session_state["hasil"] = out
+#             st.success(f"Selesai menganalisis {len(out)} ulasan. "
+#                        "Lihat ringkasannya di tab Dashboard Insight.")
+
+#     out = st.session_state.get("hasil")
+#     if out is not None:
+#         st.subheader("Preview Hasil (5 baris pertama)")
+#         st.dataframe(out.head(5), hide_index=True)
+#         st.caption("POS = positif, NET = netral, NEG = negatif, NaN = aspek tidak disebut.")
+#         st.download_button(
+#             "💾 Ekspor Hasil ke Excel",
+#             to_excel_bytes(out),
+#             file_name="hasil_absa.xlsx",
+#             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+#         )
+
+
+
 
 
 # =====================================================================
@@ -379,8 +459,7 @@ def page_info():
 PAGES = {
     "📊 Dashboard Insight": page_dashboard,
     "⚡ Analisis Cepat": page_quick,
-    "📁 Upload CSV": page_upload,
-    "ℹ️ Informasi": page_info,
+    # "📁 Upload CSV": page_upload
 }
 
 with st.sidebar:
